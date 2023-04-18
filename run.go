@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
+	"strconv"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -83,17 +85,105 @@ func copyNameserverConfig(containerID string) error {
 	return nil
 }
 
-// // Called if this program is executed with "child-mode" as the first argument
-// func execContainerCommand(mem int, swap int, pids int, cpus float64,
-// 	containerID string, imageShaHex string, args []string) {
-// 		mntPath := getContainerFSHome(containerID) + "/mnt"
-// 		cmd := exec.Command(args[0], args[1:]...)
-// 		cmd.Stdin = os.Stdin
-// 		cmd.Stdout = os.Stdout
-// 		cmd.Stderr = os.Stderr
+// Called if this program is executed with "child-mode" as the first argument
+func execContainerCommand(mem int, swap int, pids int, cpus float64,
+	containerID string, imageShaHex string, args []string) {
+	mntPath := getContainerFSHome(containerID) + "/mnt"
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 
-// 		imgConfig := parseContainerConfig(imageShaHex)
-// 		doOrDieWithMsg(unix.Sethostname([]byte(containerID)), "Unable to set hostname")
-// 		doOrDieWithMsg(joinContainerNetworkNamespace(containerID), "Unable to join container network namespace")
-		
-// }
+	imgConfig := parseContainerConfig(imageShaHex)
+	doOrDieWithMsg(unix.Sethostname([]byte(containerID)), "Unable to set hostname")
+	doOrDieWithMsg(joinContainerNetworkNamespace(containerID), "Unable to join container network namespace")
+	createCGroups(containerID, true)
+	configureCGroup(containerID, mem, swap, pids, cpus)
+	doOrDieWithMsg(copyNameserverConfig(containerID), "Unable to copy resolve.conf")
+	doOrDieWithMsg(unix.Chroot(mntPath), "Unable to chroot")
+	doOrDieWithMsg(os.Chdir("/"), "Unable to change directory")
+	createDirsIfDontExist([]string{"/proc", "/sys"})
+	doOrDieWithMsg(unix.Mount("porc", "/proc", "proc", 0, ""), "Unable to mount proc")
+	doOrDieWithMsg(unix.Mount("tmpfs", "/tmp", "tmpfs", 0, ""), "Unable to mount tmpfs")
+	doOrDieWithMsg(unix.Mount("tmpfs", "/dev", "tmpfs", 0, ""), "Unable to mount tmpfs on /dev")
+	createDirsIfDontExist([]string{"/dev/pts"})
+	doOrDieWithMsg(unix.Mount("devpts", "/dev/pts", "devpts", 0, ""), "Unable to mount devpts")
+	doOrDieWithMsg(unix.Mount("sysfs", "/sys", "sysfs", 0, ""), "Unable to mount sysfs")
+	setupLocalInterface()
+	cmd.Env = imgConfig.Config.Env
+	cmd.Run()
+	doOrDie(unix.Unmount("/dev/pts", 0))
+	doOrDie(unix.Unmount("/dev", 0))
+	doOrDie(unix.Unmount("/sys", 0))
+	doOrDie(unix.Unmount("/proc", 0))
+	doOrDie(unix.Unmount("/tmp", 0))
+}
+
+func prepareAndExecuteContainer(mem int, swap int, pids int, cpus float64,
+	containerID string, imageShaHex string, cmdArgs []string) {
+
+	// Setup the network namespace
+	cmd := &exec.Cmd{
+		Path:   "/proc/self/exe",
+		Args:   []string{"/proc/self/exe", "setup-netns", containerID},
+		Stdout: os.Stdout,
+		Stderr: os.Stderr,
+	}
+	cmd.Run()
+
+	// Namespace and setup the virtual interface
+	cmd = &exec.Cmd{
+		Path:   "/proc/self/exe",
+		Args:   []string{"/proc/self/exe", "setup-veth", containerID},
+		Stdout: os.Stdout,
+		Stderr: os.Stderr,
+	}
+	cmd.Run()
+
+	var opts []string
+	if mem > 0 {
+		opts = append(opts, "--mem="+strconv.Itoa(mem))
+	}
+	if swap >= 0 {
+		opts = append(opts, "--swap="+strconv.Itoa(swap))
+	}
+	if pids > 0 {
+		opts = append(opts, "--pids="+strconv.Itoa(pids))
+	}
+	if cpus > 0 {
+		opts = append(opts, "--cpus="+strconv.FormatFloat(cpus, 'f', 1, 64))
+	}
+	opts = append(opts, "--img="+imageShaHex)
+	args := append([]string{containerID}, cmdArgs...)
+	args = append(opts, args...)
+	args = append([]string{"child-mode"}, args...)
+	cmd = exec.Command("/proc/self/exe", args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = &unix.SysProcAttr{
+		Cloneflags: unix.CLONE_NEWPID |
+			unix.CLONE_NEWNS |
+			unix.CLONE_NEWUTS |
+			unix.CLONE_NEWIPC,
+	}
+	doOrDie(cmd.Run())
+}
+
+func initContainer(mem int, swap int, pids int, cpus float64, src string, args []string) {
+	containerID := createContainerID()
+	log.Printf("New container ID: %s\n", containerID)
+	imageShaHex := downloadImageIfRequired(src)
+	log.Printf("Image to overlay mount: %s\n", imageShaHex)
+	createContainerDirectories(containerID)
+	mountOverlayFileSystem(containerID, imageShaHex)
+	if err := setupvirtualEthOnHost(containerID); err != nil {
+		log.Fatalf("Unable to setup Veth0 on host: %v", err)
+	}
+	prepareAndExecuteContainer(mem, swap, pids, cpus, containerID, imageShaHex, args)
+	log.Printf("Conainer done.\n")
+	unmountNetworkNamespace(containerID)
+	unmountContainerFs(containerID)
+	removeCGroups(containerID)
+	os.RemoveAll(getGockerContainersPath() + "/" + containerID)
+}
