@@ -95,7 +95,7 @@ func setupContainerNetworkInterfaceStep1(containerID string) {
 	}
 }
 
-func seupContainerNetworkInterfaceStep2(containerID string) {
+func setupContainerNetworkInterfaceStep2(containerID string) {
 	nsMount := getGockerNetNsPath() + "/" + containerID
 	fd, err := unix.Open(nsMount, unix.O_RDONLY, 0)
 	defer unix.Close(fd)
